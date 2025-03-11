@@ -18,7 +18,72 @@ from pathlib import Path
 from typing import List, Dict, Set, Tuple, Optional
 import re
 from fnmatch import fnmatch
-from tqdm import tqdm
+
+# Define version here so it's accessible throughout the script
+__version__ = "1.0.2"
+
+
+class ProgressBar:
+    """Simple progress bar implementation without external dependencies."""
+
+    def __init__(self, total, width=50, prefix='Progress:', suffix='Complete', decimals=1):
+        self.total = total
+        self.width = width
+        self.prefix = prefix
+        self.suffix = suffix
+        self.decimals = decimals
+        self.iteration = 0
+        self.start_time = time.time()
+        self.last_update_time = 0
+        self.update_interval = 0.1  # seconds between updates to avoid terminal flicker
+
+    def update(self, iteration=None):
+        if iteration is not None:
+            self.iteration = iteration
+        else:
+            self.iteration += 1
+
+        # Limit update frequency to reduce terminal flicker
+        current_time = time.time()
+        if current_time - self.last_update_time < self.update_interval and self.iteration < self.total:
+            return
+
+        self.last_update_time = current_time
+
+        elapsed_time = current_time - self.start_time
+        percent = 100 * (self.iteration / float(self.total))
+
+        # Calculate estimated time remaining
+        if self.iteration > 0:
+            items_per_second = self.iteration / elapsed_time
+            if items_per_second > 0:
+                eta = (self.total - self.iteration) / items_per_second
+                time_info = f"ETA: {self._format_time(eta)} | Elapsed: {self._format_time(elapsed_time)}"
+            else:
+                time_info = f"Elapsed: {self._format_time(elapsed_time)}"
+        else:
+            time_info = f"Elapsed: {self._format_time(elapsed_time)}"
+
+        filled_length = int(self.width * self.iteration // self.total)
+        bar = '█' * filled_length + '-' * (self.width - filled_length)
+
+        # Format the percentage with specified decimals
+        formatted_percent = f"{percent:.{self.decimals}f}%"
+
+        # Print the progress bar
+        progress_line = f"\r{self.prefix} |{bar}| {formatted_percent} {self.suffix} | {self.iteration}/{self.total} | {time_info}"
+        sys.stdout.write(progress_line)
+        sys.stdout.flush()
+
+        # Print a newline when complete
+        if self.iteration >= self.total:
+            print()
+
+    def _format_time(self, seconds):
+        """Format time in seconds to HH:MM:SS format."""
+        m, s = divmod(int(seconds), 60)
+        h, m = divmod(m, 60)
+        return f"{h:01d}:{m:02d}:{s:02d}"
 
 
 class Pancake:
@@ -32,6 +97,9 @@ class Pancake:
                  use_gitignore: bool = True):
         self.source_dir = os.path.abspath(source_dir)
         self.output_dir = os.path.abspath(output_dir)
+
+        # Store the version
+        self.version = __version__
 
         # Base exclude patterns
         self.exclude_patterns = exclude_patterns or []
@@ -54,14 +122,6 @@ class Pancake:
         # Combine all exclude patterns
         self.all_patterns = self.default_exclude_patterns + self.exclude_patterns + self.gitignore_patterns
 
-        # Process exclude patterns to identify directory patterns for early skipping
-        self.dir_exclude_patterns = []
-        for pattern in self.all_patterns:
-            # Remove trailing wildcards for directory checks
-            dir_pattern = pattern.rstrip('/*')
-            if dir_pattern:
-                self.dir_exclude_patterns.append(dir_pattern)
-
         self.max_file_size_kb = max_file_size_kb
         self.include_binary = include_binary
         self.separator = separator
@@ -69,9 +129,11 @@ class Pancake:
         self.skipped_files: List[Tuple[str, str]] = []  # (path, reason)
         self.skipped_dirs: List[Tuple[str, str]] = []  # (path, reason)
 
-        # Timing information
+        # Performance metrics
         self.start_time = 0
         self.end_time = 0
+        self.total_files_examined = 0
+        self.total_dirs_examined = 0
 
     def is_binary_file(self, file_path: str) -> bool:
         """Check if a file is binary by reading the first chunk and looking for null bytes."""
@@ -122,69 +184,119 @@ class Pancake:
 
     def matches_pattern(self, path: str, pattern: str) -> bool:
         """Check if a path matches a pattern, handling gitignore-style patterns."""
+        # Get the relative path from the source directory
         rel_path = os.path.relpath(path, self.source_dir)
 
-        # Handle directory wildcards with **
-        if '**' in pattern:
-            parts = pattern.split('**')
-            if len(parts) == 2:
-                start, end = parts
-                if not start or rel_path.startswith(start):
-                    if not end or rel_path.endswith(end):
-                        return True
+        # Normalize path separators in pattern to match the current OS
+        normalized_pattern = pattern.replace('/', os.path.sep).replace('\\', os.path.sep)
 
-        # Handle single asterisk wildcards
-        if '*' in pattern:
-            return fnmatch(rel_path, pattern)
+        # For debugging
+        # print(f"Checking if '{rel_path}' matches pattern '{normalized_pattern}'")
 
-        # Handle directory-specific matching
-        if os.path.isdir(path) and pattern.endswith('/'):
-            return rel_path == pattern[:-1] or rel_path.startswith(pattern)
+        # Direct path equality
+        if rel_path == normalized_pattern:
+            return True
 
-        # Direct matching
-        return rel_path == pattern or pattern in rel_path
+        # If pattern is just the name of a file or directory
+        if os.path.basename(path) == normalized_pattern:
+            return True
 
-    def should_exclude_dir(self, dir_path: str) -> Tuple[bool, str]:
-        """Check if a directory should be excluded. This is used for early pruning."""
-        rel_path = os.path.relpath(dir_path, self.source_dir)
+        # If pattern is a simple directory name that should match anywhere in path
+        if normalized_pattern in rel_path.split(os.path.sep):
+            return True
 
-        # Check if this directory is in the exclude list or a subdirectory of an excluded dir
-        for pattern in self.dir_exclude_patterns:
-            if rel_path == pattern or rel_path.startswith(pattern + os.path.sep):
-                return True, f"Matched directory pattern {pattern}"
+        # Handle patterns with trailing slash (directory matching)
+        if normalized_pattern.endswith(os.path.sep):
+            base_pattern = normalized_pattern.rstrip(os.path.sep)
+            if rel_path == base_pattern or rel_path.startswith(base_pattern + os.path.sep):
+                return True
 
-        # Also check full patterns (for more complex directory exclusions)
-        for pattern in self.all_patterns:
-            if self.matches_pattern(dir_path, pattern):
+        # Handle pattern when it's supposed to be a complete path from source root
+        full_pattern_path = os.path.normpath(os.path.join(self.source_dir, normalized_pattern))
+        if path.startswith(full_pattern_path):
+            return True
+
+        # Directory with all contents
+        if normalized_pattern.endswith('/**'):
+            base_dir = normalized_pattern[:-3]
+            # Check if the path starts with the base directory
+            if rel_path == base_dir or rel_path.startswith(base_dir + os.path.sep):
+                return True
+
+        # Handle specific directory contents (dir/*)
+        if normalized_pattern.endswith('/*'):
+            base_dir = normalized_pattern[:-2]
+            parent_dir = os.path.dirname(rel_path)
+            if parent_dir == base_dir:
+                return True
+
+        # Handle wildcard patterns with fnmatch
+        if '*' in normalized_pattern:
+            return fnmatch(rel_path, normalized_pattern)
+
+        # Handle subdirectory matching for exact directory names
+        if os.path.isdir(path) and rel_path.startswith(normalized_pattern + os.path.sep):
+            return True
+
+        return False
+
+    def should_exclude_dir(self, path: str) -> Tuple[bool, str]:
+        """Check if a directory should be excluded based on patterns."""
+        rel_path = os.path.relpath(path, self.source_dir)
+
+        # Handle output directory to prevent recursive processing
+        if os.path.abspath(path) == self.output_dir:
+            return True, "Output directory"
+
+        # Debug directory being checked
+        # print(f"Checking directory: {rel_path}")
+
+        # First check explicit exclude patterns (user-provided patterns take priority)
+        for pattern in self.exclude_patterns:
+            # Strict checking for user-provided patterns
+            if self.matches_pattern(path, pattern):
+                return True, f"Matched user exclude pattern {pattern}"
+
+        # Then check default patterns and gitignore patterns
+        for pattern in self.default_exclude_patterns + self.gitignore_patterns:
+            if self.matches_pattern(path, pattern):
                 return True, f"Matched pattern {pattern}"
 
         return False, ""
 
-    def should_exclude(self, path: str) -> Tuple[bool, str]:
-        """Check if a path should be excluded based on patterns or file characteristics."""
+    def should_exclude_file(self, path: str) -> Tuple[bool, str]:
+        """Check if a file should be excluded based on patterns or file characteristics."""
+        # Get the relative path from the source directory
         rel_path = os.path.relpath(path, self.source_dir)
 
-        # Direct directory exclusion - check if the path is in or under any excluded directory
-        for pattern in self.dir_exclude_patterns:
-            # Check if this path is in the excluded directory or a subdirectory of it
-            if rel_path == pattern or rel_path.startswith(pattern + os.path.sep):
-                return True, f"Matched directory pattern {pattern}"
+        # Debug file being checked
+        # print(f"Checking file: {rel_path}")
 
-        # Also check normal pattern matching
-        for pattern in self.all_patterns:
+        # First check explicit exclude patterns
+        for pattern in self.exclude_patterns:
+            # Special handling for directory/** patterns
+            if pattern.endswith('/**'):
+                base_dir = pattern[:-3]
+                if rel_path == base_dir or rel_path.startswith(base_dir + os.path.sep):
+                    return True, f"File in excluded directory pattern {pattern}"
+
+            # For direct file patterns
+            if self.matches_pattern(path, pattern):
+                return True, f"Matched user exclude pattern {pattern}"
+
+        # Then check other patterns (default and gitignore)
+        for pattern in self.default_exclude_patterns + self.gitignore_patterns:
             if self.matches_pattern(path, pattern):
                 return True, f"Matched pattern {pattern}"
 
-        # Check if it's a file
-        if os.path.isfile(path):
-            # Check file size
-            size_kb = os.path.getsize(path) / 1024
-            if size_kb > self.max_file_size_kb:
-                return True, f"File too large ({size_kb:.1f} KB > {self.max_file_size_kb} KB)"
+        # Check file size
+        size_kb = os.path.getsize(path) / 1024
+        if size_kb > self.max_file_size_kb:
+            return True, f"File too large ({size_kb:.1f} KB > {self.max_file_size_kb} KB)"
 
-            # Check if binary
-            if not self.include_binary and self.is_binary_file(path):
-                return True, "Binary file (use --include-binary to include)"
+        # Check if binary
+        if not self.include_binary and self.is_binary_file(path):
+            return True, "Binary file (use --include-binary to include)"
 
         return False, ""
 
@@ -231,37 +343,18 @@ class Pancake:
         except Exception as e:
             return f"Error generating tree: {e}\n\nSimple directory listing:\n{os.listdir(self.source_dir)}"
 
-    def count_files_to_process(self) -> int:
-        """Count the total number of files that will be processed for progress bar."""
-        count = 0
-        for root, dirs, files in os.walk(self.source_dir):
-            # Early pruning - filter out excluded directories
-            dirs[:] = [d for d in dirs if not self.should_exclude_dir(os.path.join(root, d))[0]]
-
-            # Count files that won't be excluded
-            for file in files:
-                file_path = os.path.join(root, file)
-                if not self.should_exclude(file_path)[0]:
-                    count += 1
-        return count
-
     def generate_context(self) -> str:
         """Generate a context file with relevant system and project information."""
-        # Calculate time taken
-        time_taken = self.end_time - self.start_time
-        hours, remainder = divmod(time_taken, 3600)
+        # Calculate processing time
+        processing_time = self.end_time - self.start_time
+        hours, remainder = divmod(processing_time, 3600)
         minutes, seconds = divmod(remainder, 60)
-        time_str = ""
-        if hours > 0:
-            time_str += f"{int(hours)}h "
-        if minutes > 0:
-            time_str += f"{int(minutes)}m "
-        time_str += f"{seconds:.1f}s"
+        time_str = f"{int(hours)}h {int(minutes)}m {seconds:.2f}s"
 
         context = [
             "# Project Context Information",
             "",
-            f"Generated by Pancake on {platform.node()}",
+            f"Generated by Pancake v{self.version} on {platform.node()}",
             "",
             "## System Information",
             f"- OS: {platform.system()} {platform.release()}",
@@ -273,7 +366,11 @@ class Pancake:
             f"- Files Skipped: {len(self.skipped_files)}",
             f"- Directories Skipped: {len(self.skipped_dirs)}",
             f"- Filename Collisions Resolved: {self.collision_count}",
-            f"- Processing Time: {time_str}",
+            "",
+            "## Performance",
+            f"- Total Processing Time: {time_str}",
+            f"- Files Examined: {self.total_files_examined}",
+            f"- Directories Examined: {self.total_dirs_examined}",
             "",
             "## Note",
             "- Detailed exclusion information and skipped files are available in 00_pancake_excluded.md",
@@ -287,7 +384,7 @@ class Pancake:
         excluded_info = [
             "# Pancake Exclusion Information",
             "",
-            f"Generated by Pancake for project at {self.source_dir}",
+            f"Generated by Pancake v{self.version} for project at {self.source_dir}",
             "",
             "## Exclusion Patterns",
             f"- Default Patterns: {', '.join(self.default_exclude_patterns)}",
@@ -316,7 +413,8 @@ class Pancake:
             ])
             for path, reason in self.skipped_dirs:
                 rel_path = os.path.relpath(path, self.source_dir)
-                excluded_info.append(f"- `{rel_path}/`: {reason}")
+                excluded_info.append(f"- `{rel_path}`: {reason}")
+
             excluded_info.append("")
 
         if self.skipped_files:
@@ -324,28 +422,29 @@ class Pancake:
                 "## Skipped Files",
                 ""
             ])
-            # Group skipped files by reason to make the output more compact
-            reason_groups = {}
-            for path, reason in self.skipped_files:
-                if reason not in reason_groups:
-                    reason_groups[reason] = []
+            # Only show the first 1000 skipped files to avoid extremely large reports
+            max_files_to_show = 1000
+            for i, (path, reason) in enumerate(self.skipped_files[:max_files_to_show]):
                 rel_path = os.path.relpath(path, self.source_dir)
-                reason_groups[reason].append(rel_path)
+                excluded_info.append(f"- `{rel_path}`: {reason}")
 
-            for reason, paths in reason_groups.items():
-                excluded_info.append(f"### {reason}")
-                excluded_info.append("")
-                # Limit to first 100 files if there are too many
-                if len(paths) > 100:
-                    for path in paths[:100]:
-                        excluded_info.append(f"- `{path}`")
-                    excluded_info.append(f"- ... and {len(paths) - 100} more files")
-                else:
-                    for path in paths:
-                        excluded_info.append(f"- `{path}`")
-                excluded_info.append("")
+            if len(self.skipped_files) > max_files_to_show:
+                excluded_info.append(f"\n... and {len(self.skipped_files) - max_files_to_show} more files (truncated)")
 
         return '\n'.join(excluded_info)
+
+    def count_files(self, directory: str) -> int:
+        """
+        Count files in a directory tree for progress reporting.
+        This is a lightweight count that doesn't apply exclusion rules.
+        """
+        count = 0
+        for root, dirs, files in os.walk(directory):
+            # Quick check for common excludes to avoid counting thousands of files we'll skip
+            dirs[:] = [d for d in dirs if
+                       not any(d == pattern.rstrip('/*') for pattern in self.default_exclude_patterns)]
+            count += len(files)
+        return count
 
     def process(self) -> None:
         """Process the source directory and create the flattened output."""
@@ -354,65 +453,72 @@ class Pancake:
         # Create output directory if it doesn't exist
         os.makedirs(self.output_dir, exist_ok=True)
 
-        # Count files to process for progress bar
-        print("Scanning directory to count files...")
-        total_files = self.count_files_to_process()
-        print(f"Found {total_files} files to process")
-
         # Track filenames to handle collisions
         used_filenames: Set[str] = set()
 
-        # Set up progress bar
-        pbar = tqdm(total=total_files, desc="Processing files", unit="file")
+        # Estimate total files for progress bar (quick count)
+        print("Counting files for progress estimation...")
+        total_files = self.count_files(self.source_dir)
+        print(f"Found approximately {total_files} files to process")
 
-        # Walk the directory tree
+        # Initialize progress bar
+        progress = ProgressBar(total_files, prefix='Flattening:', suffix='')
+        processed_files = 0
+
+        # Walk the directory tree - optimized to skip excluded directories early
         for root, dirs, files in os.walk(self.source_dir):
-            # Early pruning - filter out excluded directories
-            for d in list(dirs):  # Make a copy of dirs so we can modify it while iterating
+            self.total_dirs_examined += 1
+
+            # Filter out excluded directories in-place for efficiency
+            # This prevents os.walk from descending into directories we don't want
+            dirs_to_remove = []
+            for i, d in enumerate(dirs):
                 dir_path = os.path.join(root, d)
                 should_exclude, reason = self.should_exclude_dir(dir_path)
                 if should_exclude:
                     self.skipped_dirs.append((dir_path, reason))
-                    dirs.remove(d)  # This will prevent os.walk from descending into this directory
+                    dirs_to_remove.append(i)
+
+            # Remove filtered directories from the list (in reverse order to preserve indices)
+            for i in sorted(dirs_to_remove, reverse=True):
+                del dirs[i]
 
             # Process each file
             for file in files:
+                self.total_files_examined += 1
                 file_path = os.path.join(root, file)
 
                 # Check if file should be excluded
-                should_exclude, reason = self.should_exclude(file_path)
+                should_exclude, reason = self.should_exclude_file(file_path)
                 if should_exclude:
                     self.skipped_files.append((file_path, reason))
-                    continue
+                else:
+                    # Generate flattened filename
+                    flat_name = self.flatten_name(file_path)
 
-                # Generate flattened filename
-                flat_name = self.flatten_name(file_path)
+                    # Handle collisions
+                    if flat_name in used_filenames:
+                        flat_name = self.resolve_collision(flat_name)
 
-                # Handle collisions
-                if flat_name in used_filenames:
-                    flat_name = self.resolve_collision(flat_name)
+                    used_filenames.add(flat_name)
 
-                used_filenames.add(flat_name)
+                    # Copy file to output directory
+                    shutil.copy2(file_path, os.path.join(self.output_dir, flat_name))
 
-                # Copy file to output directory
-                shutil.copy2(file_path, os.path.join(self.output_dir, flat_name))
-
-                # Update progress bar
-                pbar.update(1)
-
-        # Close progress bar
-        pbar.close()
+                # Update progress
+                processed_files += 1
+                progress.update(processed_files)
 
         # Record end time
         self.end_time = time.time()
 
-        print("Generating directory structure...")
+        print("\nGenerating project metadata files...")
+
         # Generate and save the tree structure
         tree_content = self.generate_tree()
         with open(os.path.join(self.output_dir, "00_directory_structure.txt"), 'w', encoding='utf-8') as f:
             f.write(tree_content)
 
-        print("Generating context files...")
         # Generate and save the context information (smaller version)
         context_content = self.generate_context()
         with open(os.path.join(self.output_dir, "00_project_context.md"), 'w', encoding='utf-8') as f:
@@ -423,27 +529,29 @@ class Pancake:
         with open(os.path.join(self.output_dir, "00_pancake_excluded.md"), 'w', encoding='utf-8') as f:
             f.write(excluded_content)
 
-        # Calculate time taken
-        time_taken = self.end_time - self.start_time
-        hours, remainder = divmod(time_taken, 3600)
-        minutes, seconds = divmod(remainder, 60)
-        time_str = ""
-        if hours > 0:
-            time_str += f"{int(hours)}h "
-        if minutes > 0:
-            time_str += f"{int(minutes)}m "
-        time_str += f"{seconds:.1f}s"
+        # Calculate elapsed time
+        elapsed_time = self.end_time - self.start_time
+        elapsed_str = f"{elapsed_time:.2f} seconds"
+        if elapsed_time > 60:
+            minutes, seconds = divmod(elapsed_time, 60)
+            elapsed_str = f"{int(minutes)} minutes, {seconds:.2f} seconds"
 
-        print(f"Directory structure flattened successfully to {self.output_dir}")
+        print(f"\nDirectory structure flattened successfully to {self.output_dir}")
         print(f"Processed: {len(used_filenames)} files")
         print(f"Skipped: {len(self.skipped_files)} files in {len(self.skipped_dirs)} directories")
         print(f"Filename collisions resolved: {self.collision_count}")
-        print(f"Total time: {time_str}")
+        print(f"Total processing time: {elapsed_str}")
+
+
+def print_version():
+    """Print the version number and exit"""
+    print(f"Pancake v{__version__}")
+    sys.exit(0)
 
 
 def main():
     parser = argparse.ArgumentParser(description='Flatten directory structure for easier uploading to Claude.')
-    parser.add_argument('source_dir', help='Source directory to flatten')
+    parser.add_argument('source_dir', nargs='?', help='Source directory to flatten')
     parser.add_argument('--output-dir', '-o', default=None,
                         help='Output directory (defaults to "pancaked" folder in the source directory)')
     parser.add_argument('--exclude', '-e', action='append',
@@ -456,17 +564,41 @@ def main():
                         help='Separator for path components in filenames (default: _)')
     parser.add_argument('--no-gitignore', action='store_true',
                         help='Ignore .gitignore files when determining what to exclude')
+    parser.add_argument('--version', '-v', action='store_true',
+                        help='Display version number and exit')
 
     args = parser.parse_args()
+
+    # Print version and exit if requested
+    if args.version:
+        print_version()
+
+    # Check if source directory is provided
+    if not args.source_dir:
+        parser.print_help()
+        print("\nError: Source directory is required.")
+        sys.exit(1)
 
     # Set default output directory to be "pancaked" folder in the source directory
     output_dir = args.output_dir
     if output_dir is None:
         output_dir = os.path.join(args.source_dir, "pancaked")
 
+    # Process exclude patterns for better matching
     exclude_patterns = []
     if args.exclude:
-        exclude_patterns.extend(args.exclude)
+        for pattern in args.exclude:
+            # Add the pattern as-is
+            exclude_patterns.append(pattern)
+            # If it's a simple name without path separators, also make sure we can match it at any level
+            if '/' not in pattern and '\\' not in pattern and '*' not in pattern:
+                # Add wildcards to match this pattern at any directory level
+                exclude_patterns.append(f"**/{pattern}")
+                exclude_patterns.append(f"**/{pattern}/**")
+
+    # Debug the patterns
+    if exclude_patterns:
+        print(f"Using exclude patterns: {exclude_patterns}")
 
     pancake = Pancake(
         source_dir=args.source_dir,

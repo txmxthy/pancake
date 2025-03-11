@@ -45,18 +45,16 @@ chmod +x "$PANCAKE_SCRIPT"
 echo -e "${YELLOW}Installing to $USER_BIN/pancake...${NC}"
 cp "$PANCAKE_SCRIPT" "$USER_BIN/pancake"
 
-# Check dependencies
-if ! command -v tree &> /dev/null; then
-    echo -e "${YELLOW}Warning: 'tree' command not found.${NC}"
-    echo -e "${YELLOW}Pancake requires the 'tree' command. Please install it:${NC}"
-    echo -e "  - Ubuntu/Debian: ${GREEN}sudo apt-get install tree${NC}"
-    echo -e "  - macOS: ${GREEN}brew install tree${NC}"
-    echo -e "  - Windows: ${GREEN}choco install tree${NC}"
-fi
-
 # Test the installation
 if command -v pancake &> /dev/null; then
     echo -e "${GREEN}✅ Pancake has been successfully installed!${NC}"
+
+    # Print version to confirm installation
+    VERSION=$(pancake --version 2>/dev/null)
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}Installed $VERSION${NC}"
+    fi
+
     echo -e "${GREEN}You can now run 'pancake' from anywhere.${NC}"
 else
     echo -e "${YELLOW}Pancake was installed to $USER_BIN/pancake${NC}"
