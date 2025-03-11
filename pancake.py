@@ -106,7 +106,7 @@ class Pancake:
         # Base exclude patterns
         self.exclude_patterns = exclude_patterns or []
         self.default_exclude_patterns = [".git", "__pycache__", "node_modules", ".DS_Store", "*.pyc", "venv", ".venv",
-                                         "env", ".env", ".idea"]
+                                         "env", "*.env", ".env", ".idea"]
 
         # Add output directory to excludes to prevent recursive flattening
         output_dir_name = os.path.basename(self.output_dir)
