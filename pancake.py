@@ -20,7 +20,7 @@ import re
 from fnmatch import fnmatch
 
 # Define version here so it's accessible throughout the script
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 
 
 class ProgressBar:
@@ -94,9 +94,11 @@ class Pancake:
                  max_file_size_kb: int = 1024,
                  include_binary: bool = False,
                  separator: str = "_",
-                 use_gitignore: bool = True):
+                 use_gitignore: bool = True,
+                 force_overwrite: bool = False):
         self.source_dir = os.path.abspath(source_dir)
         self.output_dir = os.path.abspath(output_dir)
+        self.force_overwrite = force_overwrite
 
         # Store the version
         self.version = __version__
@@ -446,15 +448,76 @@ class Pancake:
             count += len(files)
         return count
 
+    def clean_output_directory(self) -> bool:
+        """Clean the output directory if it exists and has content."""
+        if not os.path.exists(self.output_dir):
+            return True
+
+        if not os.listdir(self.output_dir):
+            return True
+
+        # If force_overwrite is set, automatically clear the directory
+        if self.force_overwrite:
+            print(f"Force flag set. Clearing output directory '{self.output_dir}'...")
+            try:
+                for item in os.listdir(self.output_dir):
+                    item_path = os.path.join(self.output_dir, item)
+                    if os.path.isfile(item_path):
+                        os.unlink(item_path)
+                    elif os.path.isdir(item_path):
+                        shutil.rmtree(item_path)
+                print(f"Directory '{self.output_dir}' has been cleared.")
+                return True
+            except Exception as e:
+                print(f"Error clearing directory: {e}")
+                return False
+
+        # Otherwise, ask for confirmation
+        print(f"\n⚠️  WARNING: Output directory '{self.output_dir}' already exists and contains files.")
+        print("Continuing will delete all existing files in this directory.")
+        print("This operation cannot be undone.")
+
+        while True:
+            response = input("Do you want to continue and overwrite the directory? (y/n): ").lower().strip()
+            if response in ['y', 'yes']:
+                try:
+                    # Clear the directory
+                    for item in os.listdir(self.output_dir):
+                        item_path = os.path.join(self.output_dir, item)
+                        if os.path.isfile(item_path):
+                            os.unlink(item_path)
+                        elif os.path.isdir(item_path):
+                            shutil.rmtree(item_path)
+                    print(f"Directory '{self.output_dir}' has been cleared.")
+                    return True
+                except Exception as e:
+                    print(f"Error clearing directory: {e}")
+                    return False
+            elif response in ['n', 'no']:
+                print("Operation aborted.")
+                return False
+            else:
+                print("Please answer 'y' or 'n'.")
+
     def process(self) -> None:
         """Process the source directory and create the flattened output."""
         self.start_time = time.time()
+
+        # Check if output directory already exists and needs to be cleaned
+        if not self.clean_output_directory():
+            sys.exit(1)
 
         # Create output directory if it doesn't exist
         os.makedirs(self.output_dir, exist_ok=True)
 
         # Track filenames to handle collisions
         used_filenames: Set[str] = set()
+
+        # Add logging for debug
+        print(f"Source directory: {self.source_dir}")
+        print(f"Output directory: {self.output_dir}")
+        if self.exclude_patterns:
+            print(f"User exclude patterns: {self.exclude_patterns}")
 
         # Estimate total files for progress bar (quick count)
         print("Counting files for progress estimation...")
@@ -538,7 +601,7 @@ class Pancake:
 
         print(f"\nDirectory structure flattened successfully to {self.output_dir}")
         print(f"Processed: {len(used_filenames)} files")
-        print(f"Skipped: {len(self.skipped_files)} files in {len(self.skipped_dirs)} directories")
+        print(f"Skipped: {len(self.skipped_files)} files + {len(self.skipped_dirs)} directories")
         print(f"Filename collisions resolved: {self.collision_count}")
         print(f"Total processing time: {elapsed_str}")
 
@@ -564,6 +627,8 @@ def main():
                         help='Separator for path components in filenames (default: _)')
     parser.add_argument('--no-gitignore', action='store_true',
                         help='Ignore .gitignore files when determining what to exclude')
+    parser.add_argument('--force', '-f', action='store_true',
+                        help='Force overwrite of output directory without prompting')
     parser.add_argument('--version', '-v', action='store_true',
                         help='Display version number and exit')
 
@@ -607,7 +672,8 @@ def main():
         max_file_size_kb=args.max_size,
         include_binary=args.include_binary,
         separator=args.separator,
-        use_gitignore=not args.no_gitignore
+        use_gitignore=not args.no_gitignore,
+        force_overwrite=args.force
     )
 
     pancake.process()
