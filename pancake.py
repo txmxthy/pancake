@@ -13,10 +13,12 @@ import argparse
 import platform
 import subprocess
 import hashlib
+import time
 from pathlib import Path
 from typing import List, Dict, Set, Tuple, Optional
 import re
 from fnmatch import fnmatch
+from tqdm import tqdm
 
 
 class Pancake:
@@ -52,11 +54,24 @@ class Pancake:
         # Combine all exclude patterns
         self.all_patterns = self.default_exclude_patterns + self.exclude_patterns + self.gitignore_patterns
 
+        # Process exclude patterns to identify directory patterns for early skipping
+        self.dir_exclude_patterns = []
+        for pattern in self.all_patterns:
+            # Remove trailing wildcards for directory checks
+            dir_pattern = pattern.rstrip('/*')
+            if dir_pattern:
+                self.dir_exclude_patterns.append(dir_pattern)
+
         self.max_file_size_kb = max_file_size_kb
         self.include_binary = include_binary
         self.separator = separator
         self.collision_count = 0
         self.skipped_files: List[Tuple[str, str]] = []  # (path, reason)
+        self.skipped_dirs: List[Tuple[str, str]] = []  # (path, reason)
+
+        # Timing information
+        self.start_time = 0
+        self.end_time = 0
 
     def is_binary_file(self, file_path: str) -> bool:
         """Check if a file is binary by reading the first chunk and looking for null bytes."""
@@ -129,9 +144,33 @@ class Pancake:
         # Direct matching
         return rel_path == pattern or pattern in rel_path
 
+    def should_exclude_dir(self, dir_path: str) -> Tuple[bool, str]:
+        """Check if a directory should be excluded. This is used for early pruning."""
+        rel_path = os.path.relpath(dir_path, self.source_dir)
+
+        # Check if this directory is in the exclude list or a subdirectory of an excluded dir
+        for pattern in self.dir_exclude_patterns:
+            if rel_path == pattern or rel_path.startswith(pattern + os.path.sep):
+                return True, f"Matched directory pattern {pattern}"
+
+        # Also check full patterns (for more complex directory exclusions)
+        for pattern in self.all_patterns:
+            if self.matches_pattern(dir_path, pattern):
+                return True, f"Matched pattern {pattern}"
+
+        return False, ""
+
     def should_exclude(self, path: str) -> Tuple[bool, str]:
         """Check if a path should be excluded based on patterns or file characteristics."""
-        # Check exclude patterns (including gitignore patterns)
+        rel_path = os.path.relpath(path, self.source_dir)
+
+        # Direct directory exclusion - check if the path is in or under any excluded directory
+        for pattern in self.dir_exclude_patterns:
+            # Check if this path is in the excluded directory or a subdirectory of it
+            if rel_path == pattern or rel_path.startswith(pattern + os.path.sep):
+                return True, f"Matched directory pattern {pattern}"
+
+        # Also check normal pattern matching
         for pattern in self.all_patterns:
             if self.matches_pattern(path, pattern):
                 return True, f"Matched pattern {pattern}"
@@ -192,8 +231,33 @@ class Pancake:
         except Exception as e:
             return f"Error generating tree: {e}\n\nSimple directory listing:\n{os.listdir(self.source_dir)}"
 
+    def count_files_to_process(self) -> int:
+        """Count the total number of files that will be processed for progress bar."""
+        count = 0
+        for root, dirs, files in os.walk(self.source_dir):
+            # Early pruning - filter out excluded directories
+            dirs[:] = [d for d in dirs if not self.should_exclude_dir(os.path.join(root, d))[0]]
+
+            # Count files that won't be excluded
+            for file in files:
+                file_path = os.path.join(root, file)
+                if not self.should_exclude(file_path)[0]:
+                    count += 1
+        return count
+
     def generate_context(self) -> str:
         """Generate a context file with relevant system and project information."""
+        # Calculate time taken
+        time_taken = self.end_time - self.start_time
+        hours, remainder = divmod(time_taken, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        time_str = ""
+        if hours > 0:
+            time_str += f"{int(hours)}h "
+        if minutes > 0:
+            time_str += f"{int(minutes)}m "
+        time_str += f"{seconds:.1f}s"
+
         context = [
             "# Project Context Information",
             "",
@@ -207,7 +271,9 @@ class Pancake:
             f"- Source Directory: {self.source_dir}",
             f"- Files Processed: {len(os.listdir(self.output_dir)) - 3}",  # Exclude tree, context, and excluded files
             f"- Files Skipped: {len(self.skipped_files)}",
+            f"- Directories Skipped: {len(self.skipped_dirs)}",
             f"- Filename Collisions Resolved: {self.collision_count}",
+            f"- Processing Time: {time_str}",
             "",
             "## Note",
             "- Detailed exclusion information and skipped files are available in 00_pancake_excluded.md",
@@ -243,30 +309,71 @@ class Pancake:
             "",
         ])
 
+        if self.skipped_dirs:
+            excluded_info.extend([
+                "## Skipped Directories",
+                ""
+            ])
+            for path, reason in self.skipped_dirs:
+                rel_path = os.path.relpath(path, self.source_dir)
+                excluded_info.append(f"- `{rel_path}/`: {reason}")
+            excluded_info.append("")
+
         if self.skipped_files:
             excluded_info.extend([
                 "## Skipped Files",
                 ""
             ])
+            # Group skipped files by reason to make the output more compact
+            reason_groups = {}
             for path, reason in self.skipped_files:
+                if reason not in reason_groups:
+                    reason_groups[reason] = []
                 rel_path = os.path.relpath(path, self.source_dir)
-                excluded_info.append(f"- `{rel_path}`: {reason}")
+                reason_groups[reason].append(rel_path)
+
+            for reason, paths in reason_groups.items():
+                excluded_info.append(f"### {reason}")
+                excluded_info.append("")
+                # Limit to first 100 files if there are too many
+                if len(paths) > 100:
+                    for path in paths[:100]:
+                        excluded_info.append(f"- `{path}`")
+                    excluded_info.append(f"- ... and {len(paths) - 100} more files")
+                else:
+                    for path in paths:
+                        excluded_info.append(f"- `{path}`")
+                excluded_info.append("")
 
         return '\n'.join(excluded_info)
 
     def process(self) -> None:
         """Process the source directory and create the flattened output."""
+        self.start_time = time.time()
+
         # Create output directory if it doesn't exist
         os.makedirs(self.output_dir, exist_ok=True)
+
+        # Count files to process for progress bar
+        print("Scanning directory to count files...")
+        total_files = self.count_files_to_process()
+        print(f"Found {total_files} files to process")
 
         # Track filenames to handle collisions
         used_filenames: Set[str] = set()
 
+        # Set up progress bar
+        pbar = tqdm(total=total_files, desc="Processing files", unit="file")
+
         # Walk the directory tree
         for root, dirs, files in os.walk(self.source_dir):
-            # Filter out excluded directories in-place
-            dirs[:] = [d for d in dirs if
-                       not any(pattern in os.path.join(root, d) for pattern in self.exclude_patterns)]
+            # Early pruning - filter out excluded directories
+            for d in list(dirs):  # Make a copy of dirs so we can modify it while iterating
+                dir_path = os.path.join(root, d)
+                should_exclude, reason = self.should_exclude_dir(dir_path)
+                if should_exclude:
+                    self.skipped_dirs.append((dir_path, reason))
+                    dirs.remove(d)  # This will prevent os.walk from descending into this directory
 
             # Process each file
             for file in files:
@@ -290,11 +397,22 @@ class Pancake:
                 # Copy file to output directory
                 shutil.copy2(file_path, os.path.join(self.output_dir, flat_name))
 
+                # Update progress bar
+                pbar.update(1)
+
+        # Close progress bar
+        pbar.close()
+
+        # Record end time
+        self.end_time = time.time()
+
+        print("Generating directory structure...")
         # Generate and save the tree structure
         tree_content = self.generate_tree()
         with open(os.path.join(self.output_dir, "00_directory_structure.txt"), 'w', encoding='utf-8') as f:
             f.write(tree_content)
 
+        print("Generating context files...")
         # Generate and save the context information (smaller version)
         context_content = self.generate_context()
         with open(os.path.join(self.output_dir, "00_project_context.md"), 'w', encoding='utf-8') as f:
@@ -305,10 +423,22 @@ class Pancake:
         with open(os.path.join(self.output_dir, "00_pancake_excluded.md"), 'w', encoding='utf-8') as f:
             f.write(excluded_content)
 
+        # Calculate time taken
+        time_taken = self.end_time - self.start_time
+        hours, remainder = divmod(time_taken, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        time_str = ""
+        if hours > 0:
+            time_str += f"{int(hours)}h "
+        if minutes > 0:
+            time_str += f"{int(minutes)}m "
+        time_str += f"{seconds:.1f}s"
+
         print(f"Directory structure flattened successfully to {self.output_dir}")
         print(f"Processed: {len(used_filenames)} files")
-        print(f"Skipped: {len(self.skipped_files)} files")
+        print(f"Skipped: {len(self.skipped_files)} files in {len(self.skipped_dirs)} directories")
         print(f"Filename collisions resolved: {self.collision_count}")
+        print(f"Total time: {time_str}")
 
 
 def main():
