@@ -1,0 +1,5 @@
+Please see all the other attached project files. For metadata about the project, dir structure etc see the 00_* prefixed files.
+
+To confirm your understanding, please provide me with the output tree of the project directory and some information you found in the 00_* files along with a summary of the project from the docs, and the previous session.
+
+Output this general knowledge about the project and where to find stuff first, then await my instructions to begin working on the actual task at hand.
