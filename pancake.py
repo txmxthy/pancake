@@ -43,6 +43,21 @@ class ProgressBar:
         else:
             self.iteration += 1
 
+        # If total is zero, display a completed bar immediately
+        if self.total == 0:
+            elapsed_time = time.time() - self.start_time
+            bar = '█' * self.width
+            formatted_percent = f"{100:.{self.decimals}f}%"
+            time_info = f"Elapsed: {self._format_time(elapsed_time)}"
+            progress_line = (
+                f"\r{self.prefix} |{bar}| {formatted_percent} {self.suffix} "
+                f"| 0/0 | {time_info}"
+            )
+            sys.stdout.write(progress_line)
+            sys.stdout.flush()
+            print()
+            return
+
         # Limit update frequency to reduce terminal flicker
         current_time = time.time()
         if current_time - self.last_update_time < self.update_interval and self.iteration < self.total:
