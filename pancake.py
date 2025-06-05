@@ -312,9 +312,17 @@ class Pancake:
         return flat_name
 
     def resolve_collision(self, filename: str) -> str:
-        """Handle filename collisions by adding a short hash."""
+        """Handle filename collisions by adding a short hash.
+
+        The previous implementation always generated the same hash for a given
+        filename.  When more than two files collapsed to the same flattened
+        name, subsequent collisions produced identical names and overwrote the
+        previous file.  We now incorporate an incrementing counter to guarantee
+        unique names across repeated collisions.
+        """
         base, ext = os.path.splitext(filename)
-        hash_val = hashlib.md5(filename.encode()).hexdigest()[:6]
+        # Include the current collision count in the hash to ensure uniqueness
+        hash_val = hashlib.md5(f"{filename}_{self.collision_count}".encode()).hexdigest()[:6]
         self.collision_count += 1
         return f"{base}_{hash_val}{ext}"
 
@@ -566,8 +574,8 @@ class Pancake:
                     # Generate flattened filename
                     flat_name = self.flatten_name(file_path)
 
-                    # Handle collisions
-                    if flat_name in used_filenames:
+                    # Handle collisions. keep generating new names until unique
+                    while flat_name in used_filenames:
                         flat_name = self.resolve_collision(flat_name)
 
                     used_filenames.add(flat_name)
