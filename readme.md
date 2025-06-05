@@ -69,7 +69,7 @@ pancake /path/to/your/project --exclude "*.log" --exclude "build/*"
 
 ## Requirements
 
-- Python 3.6+
+- Python 3.12
 - `tree` command (installed on most Unix systems)
   - Ubuntu/Debian: `sudo apt-get install tree`
   - macOS: `brew install tree`
